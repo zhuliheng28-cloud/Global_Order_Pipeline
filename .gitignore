@@ -20,3 +20,6 @@ videos/
 **/node_modules/
 **/.npm-cache/
 **/dist/
+3d_background/
+scratch/
+
