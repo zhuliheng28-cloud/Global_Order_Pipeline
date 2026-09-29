@@ -343,71 +343,72 @@ async def run_mabang_export(user_data_dir: str, days: int = 1, hours: int = 0, s
                 await asyncio.sleep(1)
                 
                 # === 检查并点击下一页 ===
-                has_next = await page.evaluate("""() => {
-                    let text = document.body.innerText;
-                    let match = text.match(/(\\d+)\\/(\\d+)页/);
-                    if(match) {
-                        let current = parseInt(match[1]);
-                        let total = parseInt(match[2]);
-                        if(current < total) {
-                            let next_page = current + 1;
-                            
-                            // 最精准的定位：寻找原生的分页函数 onclick 属性
-                            let targetA = document.querySelector(`a[onclick*="getPaginationData(${next_page}"]`);
-                            if (targetA) {
-                                targetA.click();
-                                return true;
-                            }
-                            
-                            // 备用方案 1：在常见的分页容器里找 <a> 标签
-                            let pageLinks = document.querySelectorAll('.layui-laypage a, .pagination a, div[id*="page"] a, div[class*="page"] a');
-                            for (let a of pageLinks) {
-                                if (a.innerText && a.innerText.trim() === String(next_page)) {
-                                    a.click();
-                                    return true;
-                                }
-                            }
-                            
-                            // 备用方案 2：直接找下一页箭头
-                            let nextArrow = document.querySelector('.layui-laypage-next');
-                            if(nextArrow && !nextArrow.className.includes('disabled')) {
-                                nextArrow.click();
-                                return true;
-                            }
-                            
-                            // 终极备用方案：直接执行底层函数
-                            if(typeof getPaginationData === 'function') {
-                                getPaginationData(next_page, 500);
-                                return true;
-                            }
-                        }
-                    }
-                    return false;
+                page_status = await page.evaluate("""() => {
+                    let activeBtn = document.querySelector('.btn-group button.text-danger') || document.querySelector('.btn-group .active');
+                    let currentPage = activeBtn ? parseInt(activeBtn.innerText.trim()) : 1;
+                    if (isNaN(currentPage)) currentPage = 1;
+                    
+                    let nextBtn = document.querySelector('button[data-original-title="下一页"]') || document.querySelector('button[title="下一页"]') || document.querySelector('button:has(i.ico-arrow-right22)');
+                    let nextOnclick = nextBtn ? (nextBtn.getAttribute('onclick') || '') : '';
+                    let hasNextByBtn = nextBtn && nextOnclick && !nextOnclick.includes('javascript:void(0)') && !nextBtn.className.includes('disabled');
+                    
+                    let totalMatch = document.body.innerText.match(/共\\s*(\\d+)\\s*条/);
+                    let totalOrders = totalMatch ? parseInt(totalMatch[1]) : 0;
+                    let totalPages = totalOrders > 0 ? Math.ceil(totalOrders / 500) : 1;
+                    let hasNextByTotal = (totalPages > currentPage);
+
+                    let firstOrder = document.querySelector('input.orderCheck') ? document.querySelector('input.orderCheck').value : '';
+
+                    return {
+                        currentPage,
+                        totalPages,
+                        totalOrders,
+                        hasNext: Boolean(hasNextByBtn || hasNextByTotal),
+                        firstOrder
+                    };
                 }""")
                 
-                if has_next:
-                    page_index += 1
-                    log(f"[*] 已经触发翻页动作，正在等待系统切换到第 {page_index} 页...")
+                if page_status['hasNext']:
+                    target_page = page_index + 1
+                    total_p_str = page_status.get('totalPages', '?')
+                    total_o_str = page_status.get('totalOrders', '?')
+                    log(f"[*] 检测到存在下一页数据（总计约 {total_o_str} 条，约 {total_p_str} 页），准备翻页至第 {target_page} 页...")
+                    old_order = page_status.get('firstOrder', '')
                     
-                    # 强力校验：轮询等待，直到页面上显示的页码真正变成了 page_index
-                    success = False
-                    for _ in range(20):
+                    await page.evaluate(f"""() => {{
+                        let nextBtn = document.querySelector('button[data-original-title="下一页"]') || document.querySelector('button[title="下一页"]') || document.querySelector('button:has(i.ico-arrow-right22)');
+                        let numBtn = document.querySelector('button[onclick*="getPaginationData({target_page},"]');
+                        if (nextBtn && nextBtn.getAttribute('onclick') && !nextBtn.getAttribute('onclick').includes('javascript:void(0)')) {{
+                            nextBtn.click();
+                        }} else if (numBtn) {{
+                            numBtn.click();
+                        }} else if (typeof getPaginationData === 'function') {{
+                            getPaginationData({target_page}, 500);
+                        }}
+                    }}""")
+                    
+                    # 轮询等待新页面渲染完成
+                    page_changed = False
+                    for _ in range(25):
                         await asyncio.sleep(1)
-                        current_displayed = await page.evaluate("""() => {
-                            let match = document.body.innerText.match(/(\\d+)\\/(\\d+)页/);
-                            return match ? parseInt(match[1]) : 0;
+                        cur_status = await page.evaluate("""() => {
+                            let activeBtn = document.querySelector('.btn-group button.text-danger') || document.querySelector('.btn-group .active');
+                            let curPage = activeBtn ? parseInt(activeBtn.innerText.trim()) : 0;
+                            let firstOrder = document.querySelector('input.orderCheck') ? document.querySelector('input.orderCheck').value : '';
+                            return { curPage, firstOrder };
                         }""")
-                        if current_displayed == page_index:
-                            success = True
-                            log(f"[*] 页面已成功刷新并定位到第 {page_index} 页！")
+                        if cur_status['curPage'] == target_page and cur_status['firstOrder'] != old_order:
+                            page_changed = True
+                            log(f"[*] 页面已成功刷新并定位到第 {target_page} 页！")
                             break
-                    
-                    if not success:
-                        log(f"[!] 警告：翻页等待超时，可能页面未成功跳转，仍将尝试强行处理。")
+                            
+                    if not page_changed:
+                        log(f"[!] 警告：翻页等待超时，当前未检测到第 {target_page} 页完全渲染，尝试继续处理。")
                         
-                    await asyncio.sleep(4) # 给表格额外的时间完成渲染
+                    await asyncio.sleep(3) # 给予表格 DOM 充分的渲染缓冲
+                    page_index += 1
                 else:
-                    log("[*] 所有页数据已全部导出完毕！")
+                    log(f"[*] 所有页数据已全部导出完毕（共处理 {page_index} 页）！")
                     break
 
             # === 保存合并后的大表 ===
@@ -427,6 +428,11 @@ async def run_mabang_export(user_data_dir: str, days: int = 1, hours: int = 0, s
                     save_df_to_excel(final_df, output_excel)
                     log(f"[*] 进度提示：已成功生成 DSers 格式最终模板，共 {len(final_df)} 条订单数据")
                     log(f"[*] 成功生成 DSers 格式最终模板: {output_excel}")
+                    # 清理临时分页文件
+                    for f_tmp in os.listdir(download_dir):
+                        if f_tmp.startswith("temp_dsers_page_") and f_tmp.endswith(".xls"):
+                            try: os.remove(os.path.join(download_dir, f_tmp))
+                            except Exception: pass
                 except Exception as e:
                     log(f"[!] 无法保存表格 (可能表格正被 Excel 占用打开): {e}")
                     raise e

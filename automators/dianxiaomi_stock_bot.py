@@ -239,6 +239,56 @@ async def fetch_dianxiaomi_shops(user_data_dir: str = DIANXIAOMI_SESSION_DIR, he
             return load_cached_shops()
 
 
+async def dismiss_announcement_popup(page, log=None):
+    """
+    自动检测并关闭店小秘首页及列表页弹出的营销/活动公告弹窗（如“线下活动”、“小秘公告”等）
+    """
+    try:
+        # 1. 优先使用 Playwright 原生 Locator 定位包含活动公告特征的弹窗
+        modal_loc = page.locator('.modal, .modal-dialog, .ant-modal, .ant-modal-content, .d-modal, .el-dialog, [role="dialog"], div').filter(has_text="线下活动").filter(has_text="小秘公告")
+        if await modal_loc.count() > 0 and await modal_loc.first.is_visible():
+            close_btn = modal_loc.first.locator('button:has-text("关闭"), a:has-text("关闭"), .close, .ant-modal-close, .ant-modal-close-x').filter(state="visible").first
+            if await close_btn.count() > 0:
+                await close_btn.click(force=True)
+                if log: log("🔔 检测到小秘公告/线下活动弹窗，已自动点击【关闭】！")
+                await asyncio.sleep(1)
+                return
+    except Exception:
+        pass
+
+    try:
+        # 2. 深度 DOM 探测与安全关闭
+        closed = await page.evaluate('''() => {
+            let closedAny = false;
+            const dialogs = Array.from(document.querySelectorAll('.modal, .modal-dialog, .ant-modal, .ant-modal-content, .d-modal, .el-dialog, [role="dialog"], div[class*="dialog"], div[class*="modal"]'));
+            for (const d of dialogs) {
+                const t = (d.innerText || '');
+                if (t.includes('线下活动') || t.includes('小秘公告') || t.includes('美客多拉美招商') || t.includes('拉美蓝海') || t.includes('活动倒计时')) {
+                    const closeBtn = Array.from(d.querySelectorAll('button, a, span')).find(b => (b.innerText || '').trim() === '关闭');
+                    if (closeBtn) {
+                        closeBtn.click();
+                        closedAny = true;
+                        continue;
+                    }
+                    const closeX = d.querySelector('.close, .ant-modal-close, .ant-modal-close-x, [aria-label*="close" i], [class*="close"]');
+                    if (closeX) {
+                        closeX.click();
+                        closedAny = true;
+                        continue;
+                    }
+                    d.style.display = 'none';
+                    closedAny = true;
+                }
+            }
+            return closedAny;
+        }''')
+        if closed:
+            if log: log("🔔 检测到小秘公告/活动推广弹窗，已自动关闭！")
+            await asyncio.sleep(1)
+    except Exception:
+        pass
+
+
 async def run_dianxiaomi_stock_update(
     shop_code: str,
     target_stock: int,
@@ -281,6 +331,7 @@ async def run_dianxiaomi_stock_update(
         log(f"[*] 导航至速卖通在线列表: {target_url}")
         await page.goto(target_url, wait_until='domcontentloaded', timeout=60000)
         await _ensure_logged_in(page, context, username, password, target_url, log, task_info=task_info)
+        await dismiss_announcement_popup(page, log)
 
         # 1. 点击目标店铺（最多等待 15 秒供 Vue 动态店铺列表加载完成）
         log(f"[*] [步骤 1/7] 定位并点击店铺 [{shop_code}]...")
@@ -289,6 +340,7 @@ async def run_dianxiaomi_stock_update(
         for retry_idx in range(15):
             if task_info:
                 await task_info.async_check_pause()
+            await dismiss_announcement_popup(page, log)
             click_res = await page.evaluate('''(code) => {
                 const items = Array.from(document.querySelectorAll('.d-tag-group-item, .d-tag-group-item__inner, span')).filter(el => {
                     return el.textContent.includes(code) && (el.classList.contains('d-tag-group-item') || el.classList.contains('d-tag-group-item__inner') || el.tagName === 'SPAN');
@@ -310,6 +362,7 @@ async def run_dianxiaomi_stock_update(
             raise RuntimeError(f"未在页面找到店铺代号【{shop_code}】对应的选项卡，请检查店铺代号是否正确！")
         log(f"✅ 已选中店铺: {click_text}")
         await asyncio.sleep(3)
+        await dismiss_announcement_popup(page, log)
 
         # 2. 切换分页为 300条/页
         log("[*] [步骤 2/7] 切换分页条数为 300条/页...")
@@ -325,6 +378,7 @@ async def run_dianxiaomi_stock_update(
             await asyncio.sleep(5)
         else:
             log("⚠️ 未找到分页选择器，使用当前默认条数继续...")
+        await dismiss_announcement_popup(page, log)
 
         # 3. 全选在线商品
         log("[*] [步骤 3/7] 点击表头复选框进行全选...")

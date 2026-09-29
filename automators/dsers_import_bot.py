@@ -1,6 +1,7 @@
 import asyncio
 import os
 from playwright.async_api import async_playwright
+from login_helpers.dsers_login import wait_or_auto_login_dsers
 
 async def run_dsers_import(csv_path: str, user_data_dir: str, headless: bool = False, progress_callback=None, task_info=None):
     def log(msg):
@@ -54,16 +55,14 @@ async def run_dsers_import(csv_path: str, user_data_dir: str, headless: bool = F
                 await asyncio.sleep(2)
                 await page.goto(TARGET_URL, wait_until='domcontentloaded')
             
-            while "login" in page.url.lower():
-                await asyncio.sleep(1)
+            await wait_or_auto_login_dsers(page, log_func=log, timeout_seconds=30, task_info=task_info)
             
             log("[*] 检测到已进入 DSers 首页/主控台！")
             log("[*] 为方便您操作（如：按掉广告、确认账号或退出重进等），系统将等待 15 秒...")
             for i in range(15, 0, -1):
                 if "login" in page.url.lower() or "accounts.dsers.com" in page.url.lower():
                     log("[*] 检测到您点击了退出，正在等待您登录新账号...")
-                    while "login" in page.url.lower() or "accounts.dsers.com" in page.url.lower():
-                        await asyncio.sleep(1)
+                    await wait_or_auto_login_dsers(page, log_func=log, timeout_seconds=30, task_info=task_info)
                     log("[*] 重新登录成功！等待 5 秒缓冲...")
                     await asyncio.sleep(5)
                     break

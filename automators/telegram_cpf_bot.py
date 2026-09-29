@@ -11,14 +11,14 @@ import sys
 
 # 导入中心化配置
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import SCRIPT_TEMPLATE
+from config import SCRIPT_TEMPLATE, TELEGRAM_SESSION_DIR
 
 # 初始化 OCR 和 DET 目标检测单例，关闭广告输出
 ocr = ddddocr.DdddOcr(show_ad=False)
 det = ddddocr.DdddOcr(det=True, show_ad=False)
 
 EXCEL_PATH = SCRIPT_TEMPLATE
-USER_DATA_DIR = os.path.join(os.getcwd(), "telegram_session")
+USER_DATA_DIR = TELEGRAM_SESSION_DIR
 CHAT_NAME = "Skynet Robot (Privado)"
 
 def solve_math_captcha(image_bytes):
@@ -169,6 +169,27 @@ def solve_math_captcha(image_bytes):
         if operator:
             print(f"[*] 确认运算符为: {operator}")
             
+        def clean_num_str(t):
+            replacements = {
+                'o': '0', 'O': '0', 'D': '0', 'Q': '0',
+                'l': '1', 'I': '1', '|': '1', 'i': '1', '!': '1', 'j': '1', '/': '1', '\\': '1', '[': '1', ']': '1',
+                's': '5', 'S': '5',
+                'b': '6',
+                '乙': '7', '?': '7', '>': '7', '^': '7',
+                'B': '8', '&': '8',
+                'q': '9', 'g': '9',
+                'A': '4', 'u': '4'
+            }
+            if '7' in res and '2' not in res:
+                replacements['z'] = '7'
+                replacements['Z'] = '7'
+            else:
+                replacements['z'] = '2'
+                replacements['Z'] = '2'
+            for k, v in replacements.items():
+                t = t.replace(k, v)
+            return t
+
         # 5. 解析操作数 (支持两位数，如 11 - 2, 14 - 5)
         n1, n2 = None, None
         try:
@@ -184,22 +205,6 @@ def solve_math_captcha(image_bytes):
                         
                 left_boxes = digit_boxes[:split_idx+1]
                 right_boxes = digit_boxes[split_idx+1:]
-                
-                def clean_num_str(t):
-                    replacements = {
-                        'o': '0', 'O': '0', 'D': '0', 'Q': '0',
-                        'l': '1', 'I': '1', '|': '1', 'i': '1', '!': '1', 'j': '1', '/': '1', '\\': '1', '[': '1', ']': '1',
-                        'z': '2', 'Z': '2',
-                        's': '5', 'S': '5',
-                        'b': '6',
-                        '乙': '7', '?': '7', '>': '7', '^': '7',
-                        'B': '8', '&': '8',
-                        'q': '9', 'g': '9',
-                        'A': '4', 'u': '4'
-                    }
-                    for k, v in replacements.items():
-                        t = t.replace(k, v)
-                    return t
 
                 def extract_number_from_boxes(boxes):
                     min_x = min(b[0] for b in boxes)
@@ -222,6 +227,27 @@ def solve_math_captcha(image_bytes):
                     print(f"[*] 物理分块裁剪提取操作数成功: n1={n1}, n2={n2}")
         except Exception as e:
             print(f"[!] 物理裁剪提取数字出错: {e}")
+
+        # 增强：若目标检测分块因连笔杂线未识别，或在减法中出现反常负数 (n1 < n2)，采用自适应左右区域精准重采
+        if n1 is None or n2 is None or (operator == '-' and n1 < n2):
+            try:
+                crop_l = image_L.crop((int(w * 0.05), int(h * 0.1), int(w * 0.35), int(h * 0.9)))
+                arr_l = io.BytesIO()
+                crop_l.save(arr_l, format='PNG')
+                d_l = re.sub(r'[^\d]', '', clean_num_str(ocr.classification(arr_l.getvalue())))
+
+                crop_r = image_L.crop((int(w * 0.43), int(h * 0.1), int(w * 0.65), int(h * 0.9)))
+                arr_r = io.BytesIO()
+                crop_r.save(arr_r, format='PNG')
+                d_r = re.sub(r'[^\d]', '', clean_num_str(ocr.classification(arr_r.getvalue())))
+
+                if d_l and d_r:
+                    zn1, zn2 = int(d_l), int(d_r)
+                    if operator != '-' or zn1 >= zn2:
+                        n1, n2 = zn1, zn2
+                        print(f"[*] 自适应区域重采操作数成功: n1={n1}, n2={n2}")
+            except Exception as e:
+                print(f"[!] 自适应区域重采出错: {e}")
             
         # 如果物理裁剪未完全获取，回退到全局字符串解析
         if n1 is None or n2 is None:
@@ -279,13 +305,39 @@ def solve_math_captcha(image_bytes):
             elif operator == '*':
                 certain_ans_str = str(n1 * n2)
 
+        # 提取全局 OCR 直接给出的乘法/加减法算式备用答案
+        global_direct_ans = None
+        gm = re.search(r'(\d+)\s*([\*\+\-])\s*(\d+)', res_raw)
+        if gm:
+            try:
+                gn1 = int(gm.group(1))
+                gop = gm.group(2)
+                gn2_str = gm.group(3)
+                if len(gn2_str) > 1 and gn2_str[-1] in '37j?' and int(gn2_str[:-1]) <= 20:
+                    gn2 = int(gn2_str[:-1])
+                else:
+                    gn2 = int(gn2_str)
+                if gop == '*': global_direct_ans = str(gn1 * gn2)
+                elif gop == '+': global_direct_ans = str(gn1 + gn2)
+                elif gop == '-' and gn1 >= gn2: global_direct_ans = str(gn1 - gn2)
+            except Exception:
+                pass
+
         seen = set()
         possible_ans_str = []
+        if global_direct_ans:
+            possible_ans_str.append(global_direct_ans)
+            seen.add(global_direct_ans)
+            
         for a in ordered_ans:
             if str(a) not in seen:
                 seen.add(str(a))
                 possible_ans_str.append(str(a))
                 
+        # 乘法场景下若物理切块出现异常或全局直解更明确，优先采用全局直解
+        if global_direct_ans and (operator == '*' or not certain_ans_str):
+            certain_ans_str = global_direct_ans
+
         if certain_ans_str:
             print(f"[*] 确定的答案为: {certain_ans_str}")
         print(f"[*] 从OCR结果 '{res}' 猜测的可能答案 (按优先级): {possible_ans_str}")
@@ -305,6 +357,12 @@ async def run_cpf_query(excel_path=EXCEL_PATH, user_data_dir=USER_DATA_DIR, head
     log(f"[*] 加载 Excel 文件: {excel_path}")
     wb = load_workbook(excel_path, data_only=True)
     ws = wb.active
+    if ws.max_column < 6 or not ws.cell(row=1, column=6).value:
+        ws.cell(row=1, column=6, value="出生日期")
+        try:
+            wb.save(excel_path)
+        except Exception:
+            pass
 
     for item in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
         p_lock = os.path.join(user_data_dir, item)
@@ -378,20 +436,59 @@ async def run_cpf_query(excel_path=EXCEL_PATH, user_data_dir=USER_DATA_DIR, head
             
             async def close_popup_if_any():
                 try:
-                    clicked = await page.evaluate('''() => {
-                        let text = document.body.innerText || "";
-                        if (text.includes("resolvido") || text.includes("já pode continuar")) {
-                            let btns = Array.from(document.querySelectorAll('button, .btn, [role="button"]'));
-                            let okBtn = btns.find(b => b.innerText && b.innerText.trim().toUpperCase() === 'OK');
-                            if (okBtn) {
-                                okBtn.click();
-                                return true;
+                    info = await page.evaluate('''() => {
+                        // 1. 查找是否存在 Telegram Web K 弹窗层
+                        const popup = document.querySelector('.popup.active, .popup, .modal-dialog, .popup-container, div[role="dialog"]');
+                        const bodyText = document.body.innerText || "";
+                        
+                        // 提取弹窗内文本（若找到弹窗容器取容器内文本，否则取 bodyText）
+                        let popupText = "";
+                        if (popup) {
+                            popupText = (popup.innerText || "").trim();
+                        } else {
+                            let lower = bodyText.toLowerCase();
+                            if (lower.includes("resolvido") || lower.includes("já pode continuar") || 
+                                lower.includes("errad") || lower.includes("incorret") || lower.includes("tente novamente") ||
+                                lower.includes("captcha") || lower.includes("bloque") || lower.includes("aguarde")) {
+                                popupText = bodyText.trim();
                             }
                         }
-                        return false;
+                        
+                        // 2. 寻找关闭/确认按钮：优先在弹窗容器内寻找，没有则在全局寻找 OK
+                        let targetBtn = null;
+                        const searchScope = popup || document;
+                        const btns = Array.from(searchScope.querySelectorAll('button, .btn, [role="button"]'));
+                        
+                        // 寻找特定文字按钮
+                        targetBtn = btns.find(b => {
+                            const t = (b.innerText || "").trim().toUpperCase();
+                            return t === 'OK' || t === 'FECHAR' || t === 'CONFIRMAR' || t === 'ENTENDI' || t === 'CLOSE';
+                        });
+                        
+                        // 若弹窗容器内未找到特定文字，且容器内只有1个主按钮
+                        if (!targetBtn && popup) {
+                            targetBtn = popup.querySelector('.btn-primary, .popup-button, button');
+                        }
+                        
+                        // 全局保底寻找 OK 按钮 (只要页面上有独立 OK 按钮，即视为弹窗确认按钮)
+                        if (!targetBtn) {
+                            const allBtns = Array.from(document.querySelectorAll('button, .btn, [role="button"]'));
+                            targetBtn = allBtns.find(b => (b.innerText || "").trim().toUpperCase() === 'OK');
+                        }
+                        
+                        if (targetBtn) {
+                            const btnLabel = (targetBtn.innerText || "").trim();
+                            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evtType => {
+                                targetBtn.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
+                            });
+                            targetBtn.click();
+                            return { closed: true, text: popupText.substring(0, 150), btn: btnLabel };
+                        }
+                        return { closed: false };
                     }''')
-                    if clicked:
-                        log("[*] 已成功侦测并强制关闭了 OK 弹窗！")
+                    if info and info.get('closed'):
+                        popup_snippet = info.get('text', '').replace('\n', ' ')
+                        log(f"[*] 成功侦测并关闭弹窗 (按钮: '{info.get('btn')}'): {popup_snippet!r}")
                         await asyncio.sleep(0.5)
                         return True
                 except Exception as e:
@@ -513,6 +610,7 @@ async def run_cpf_query(excel_path=EXCEL_PATH, user_data_dir=USER_DATA_DIR, head
             
             reply_text = ""
             attempts = 0
+            cpf_mismatch_retries = 0
             last_handled_captcha = None
             verification_failed_id = None
             last_handled_leftover_id = None
@@ -574,6 +672,24 @@ async def run_cpf_query(excel_path=EXCEL_PATH, user_data_dir=USER_DATA_DIR, head
                     break
 
                 if "nome" in text_lower:
+                    # 校验回复中的 CPF 是否与当前查询的 CPF 一致
+                    reply_cpf_match = re.search(r'(?i)cpf[\s:]*([0-9\.\-]+)', reply_text)
+                    if reply_cpf_match:
+                        raw_target_cpf = re.sub(r'\D', '', str(cpf_text))
+                        target_cpf = raw_target_cpf[-11:] if len(raw_target_cpf) > 11 else raw_target_cpf
+                        raw_reply_cpf = re.sub(r'\D', '', reply_cpf_match.group(1))
+                        reply_cpf = raw_reply_cpf[-11:] if len(raw_reply_cpf) > 11 else raw_reply_cpf
+                        
+                        if target_cpf and reply_cpf and target_cpf != reply_cpf:
+                            cpf_mismatch_retries += 1
+                            if cpf_mismatch_retries >= 5:
+                                log(f"[!] 警告：CPF 连续 {cpf_mismatch_retries} 次不匹配 (期望: {target_cpf}, 实际: {reply_cpf})，达到上限，将结果置空并跳过！")
+                                reply_text = ""
+                                break
+                            log(f"[!] 警告：回复中的 CPF ({reply_cpf}) 与当前查询 ({target_cpf}) 不匹配 (第 {cpf_mismatch_retries}/5 次)！重新发送查询并等待...")
+                            await send_query()
+                            attempts = 0
+                            continue
                     break
                         
                 if "muitas requisições" in text_lower or "suspenso" in text_lower or "captcha" in text_lower or "errado" in text_lower:
@@ -829,9 +945,11 @@ async def run_cpf_query(excel_path=EXCEL_PATH, user_data_dir=USER_DATA_DIR, head
                         else:
                             log("[!] 重新扫描未找到验证码，自动测试模式下直接跳过并记录失败。")
                             import time
+                            os.makedirs("scratch", exist_ok=True)
                             with open(f"scratch/failed_captcha_{int(time.time())}.png", "wb") as f:
                                 f.write(image_bytes)
                             ws.cell(row=r_idx, column=5, value="遇到验证码且未能通过")
+                            ws.cell(row=r_idx, column=6, value="")
                             try:
                                 wb.save(excel_path)
                             except PermissionError:
@@ -856,6 +974,7 @@ async def run_cpf_query(excel_path=EXCEL_PATH, user_data_dir=USER_DATA_DIR, head
             if is_timeout:
                 log(f"    -> 等待回复超时。")
                 ws.cell(row=r_idx, column=5, value="查询超时")
+                ws.cell(row=r_idx, column=6, value="")
             else:
                 text_lower = reply_text.lower()
                 if "nome" in text_lower:
@@ -864,6 +983,17 @@ async def run_cpf_query(excel_path=EXCEL_PATH, user_data_dir=USER_DATA_DIR, head
                         extracted_name = match.group(1).strip()
                         log(f"    -> 成功提取到名字: {extracted_name}")
                         ws.cell(row=r_idx, column=5, value=extracted_name)
+
+                        # 提取出生日期 (例如 NASCIMENTO: 16/10/1979)
+                        birth_match = re.search(r'(?i)nascimento[\s:]*([0-9]{2}/[0-9]{2}/[0-9]{4})', reply_text)
+                        if not birth_match:
+                            birth_match = re.search(r'(?i)nascimento[\s:]*([^\n\r]+)', reply_text)
+                        if birth_match:
+                            extracted_birth = birth_match.group(1).strip()
+                            log(f"    -> 成功提取到出生日期: {extracted_birth}")
+                            ws.cell(row=r_idx, column=6, value=extracted_birth)
+                        else:
+                            ws.cell(row=r_idx, column=6, value="")
                         
                         last_successful_reply_text = reply_text
                         last_processed_cpf = cpf_text
@@ -873,11 +1003,16 @@ async def run_cpf_query(excel_path=EXCEL_PATH, user_data_dir=USER_DATA_DIR, head
                             ws.cell(row=r_idx, column=5, value="")
                         else:
                             ws.cell(row=r_idx, column=5, value="提取失败")
+                        ws.cell(row=r_idx, column=6, value="")
                 elif any(k in text_lower for k in negative_keywords):
                     log(f"    -> CPF 未找到或无效，跳过此号码。")
                     ws.cell(row=r_idx, column=5, value="无")
+                    ws.cell(row=r_idx, column=6, value="")
                 else:
-                    if is_retry:
+                    if cpf_mismatch_retries >= 5:
+                        log(f"    -> CPF 多次不匹配，已跳过并置空。")
+                        ws.cell(row=r_idx, column=5, value="")
+                    elif is_retry:
                         log(f"    -> 重试仍未成功，将结果留空。")
                         ws.cell(row=r_idx, column=5, value="")
                     else:
@@ -887,6 +1022,7 @@ async def run_cpf_query(excel_path=EXCEL_PATH, user_data_dir=USER_DATA_DIR, head
                         else:
                             log(f"    -> 未收到包含 nome 的回复。")
                             ws.cell(row=r_idx, column=5, value="提取失败")
+                    ws.cell(row=r_idx, column=6, value="")
                 
             try:
                 wb.save(excel_path)

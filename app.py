@@ -93,7 +93,8 @@ def select_uploaded_template_dialog(file_buffer, file_id):
             f.write(file_buffer)
             
         if template_choice == "下单模板.xlsx":
-            clean_order_template_to_script(dest_path, SCRIPT_TEMPLATE, st.session_state.route, sw_dsers_rename=False)
+            is_rename = (st.session_state.get("route") == "B" and st.session_state.get("sw_dsers_rename_key", False))
+            clean_order_template_to_script(dest_path, SCRIPT_TEMPLATE, st.session_state.route, sw_dsers_rename=is_rename)
             
         st.rerun()
 
@@ -104,6 +105,8 @@ def on_dsers_rename_change():
         st.session_state["sw_dsers_cpf_merge_key"] = False
         st.session_state["sw_dsers_mabang_key"] = False
         st.session_state["sw_dsers_import_key"] = False
+        if os.path.exists(ORDER_TEMPLATE):
+            clean_order_template_to_script(ORDER_TEMPLATE, SCRIPT_TEMPLATE, "B", sw_dsers_rename=True)
 
 def on_dsers_normal_change():
     if any([
@@ -114,6 +117,8 @@ def on_dsers_normal_change():
         st.session_state.get("sw_dsers_import_key", False)
     ]):
         st.session_state["sw_dsers_rename_key"] = False
+        if os.path.exists(ORDER_TEMPLATE):
+            clean_order_template_to_script(ORDER_TEMPLATE, SCRIPT_TEMPLATE, "B", sw_dsers_rename=False)
 
 @st.fragment(run_every="2s")
 def render_live_task_hub():
@@ -534,6 +539,9 @@ def execute_pipeline_task(
     sw_dsers_rename: bool,
     use_vault: bool,
     vault_file_choice: str,
+    sku_filter: str = "code",
+    mabang_update_mode: str = "both",
+    dsers_update_fields: list = None,
     progress_callback = None,
     task_info = None
 ):
@@ -579,6 +587,7 @@ def execute_pipeline_task(
                 days=days,
                 hours=hours,
                 customer_id=search_val,
+                sku_filter=sku_filter,
                 headless=False,
                 progress_callback=log,
                 task_info=task_info
@@ -617,8 +626,8 @@ def execute_pipeline_task(
 
         if sw_mabang_update:
             if task_info: task_info.check_pause()
-            log("[阶段 4/4] 正在同步数据至马帮 ERP...")
-            task_info.run_async(run_mabang_batch_update(current_excel_path, MABANG_SESSION_DIR, headless=False, progress_callback=log, task_info=task_info))
+            log(f"[阶段 4/4] 正在同步数据至马帮 ERP (模式: {mabang_update_mode})...")
+            task_info.run_async(run_mabang_batch_update(current_excel_path, MABANG_SESSION_DIR, update_mode=mabang_update_mode, headless=False, progress_callback=log, task_info=task_info))
             log("[阶段 4] 马帮 ERP 数据同步完成。")
 
     else: # Route B
@@ -652,8 +661,8 @@ def execute_pipeline_task(
             
         if sw_dsers_mabang:
             if task_info: task_info.check_pause()
-            log("[阶段 4/5] 正在同步真实姓名至马帮 ERP...")
-            task_info.run_async(run_mabang_batch_update(SCRIPT_TEMPLATE, MABANG_SESSION_DIR, headless=False, progress_callback=log, task_info=task_info))
+            log(f"[阶段 4/5] 正在同步真实姓名至马帮 ERP (模式: {mabang_update_mode})...")
+            task_info.run_async(run_mabang_batch_update(SCRIPT_TEMPLATE, MABANG_SESSION_DIR, update_mode=mabang_update_mode, headless=False, progress_callback=log, task_info=task_info))
             log("[阶段 4] 马帮 ERP 数据同步完成。")
                 
         if sw_dsers_import:
@@ -664,9 +673,10 @@ def execute_pipeline_task(
 
         if sw_dsers_rename:
             if task_info: task_info.check_pause()
-            log("[阶段 独立] 正在处理 DSers 网页端订单自动改名...")
-            task_info.run_async(run_dsers_rename(current_excel_path, DSERS_SESSION_DIR, False, lambda m: log(f"[DSers 实时] {m}"), task_info=task_info))
-            log("[阶段 独立] DSers 订单网页改名处理完成。")
+            active_fields_str = "全部" if not dsers_update_fields else ", ".join(dsers_update_fields)
+            log(f"[阶段 独立] 正在处理 DSers 网页端订单自动修改 (目标字段: {active_fields_str})...")
+            task_info.run_async(run_dsers_rename(current_excel_path, DSERS_SESSION_DIR, False, lambda m: log(f"[DSers 实时] {m}"), task_info=task_info, update_fields=dsers_update_fields))
+            log("[阶段 独立] DSers 订单网页修改处理完成。")
 
     log(f"🎉 {pipeline_name} 流水线全部步骤执行完毕！")
 
@@ -1599,6 +1609,8 @@ else:
     days = 1
     hours = 0
     search_val = ""
+    sku_filter = "code"
+    mabang_update_mode = "both"
 
     with st.container(border=True):
         st.markdown("### 第一步：获取要处理的订单数据")
@@ -1618,9 +1630,14 @@ else:
                     hours = st.number_input("精确到小时", min_value=0, max_value=23, value=0)
             with c2:
                 if st.session_state.route == "A":
-                    search_val = st.text_input("要提取的买家客户 ID", value="1000000257")
+                    col_c1, col_c2 = st.columns(2)
+                    with col_c1:
+                        search_val = st.text_input("条件1: 买家客户ID (选填)", value="1000000257")
+                    with col_c2:
+                        sku_filter = st.text_input("条件2: 排除包含SKU (选填)", value="code")
                 else:
                     search_val = st.text_input("要过滤排除的 SKU", value="code")
+                    sku_filter = search_val
         elif data_source == "上传本地表格":
             st.markdown("<br>", unsafe_allow_html=True)
             uploaded_file = st.file_uploader("请选择或拖入 .xlsx 表格文件", type=["xlsx", "xls"])
@@ -1668,12 +1685,26 @@ else:
 
     st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
 
+    dsers_update_fields = ["name", "cpf", "birthday"]
     if st.session_state.route == "A":
         with st.container(border=True):
             st.markdown("### 第二步：选择要执行的步骤")
             sw_cpf_rename = st.toggle("自动连接 Telegram 执行 CPF 查询与核对", value=True)
             sw_cpf_merge = st.toggle("将 CPF 查询结果回填至 DSERS 导入表格中", value=False)
-            sw_mabang_update = st.toggle("将 CPF 查询核准后的姓名同步更新回马帮 ERP", value=True)
+            sw_mabang_update = st.toggle("将 CPF 查询核准结果同步更新回马帮 ERP", value=True)
+            if sw_mabang_update:
+                mode_choice = st.radio(
+                    "马帮回传更新内容",
+                    ["全部更新（姓名 + 出生日期）", "仅更新客户姓名", "仅更新出生日期（公司名称）"],
+                    index=0,
+                    horizontal=True
+                )
+                if mode_choice == "仅更新客户姓名":
+                    mabang_update_mode = "name_only"
+                elif mode_choice == "仅更新出生日期（公司名称）":
+                    mabang_update_mode = "birth_only"
+                else:
+                    mabang_update_mode = "both"
         
         st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
         render_dianxiaomi_stock_module(key_prefix="cpf")
@@ -1693,7 +1724,24 @@ else:
             sw_dsers_mabang = st.toggle("把 CPF 查询核准完成的姓名同步更新回马帮 ERP", key="sw_dsers_mabang_key", on_change=on_dsers_normal_change)
             sw_dsers_import = st.toggle("一键把整理好的表格上传到 DSERS 后台并批量建单", key="sw_dsers_import_key", on_change=on_dsers_normal_change)
             st.markdown("---")
-            sw_dsers_rename = st.toggle("直接打开 DSERS 网页端，针对后台已有订单自动修改买家姓名", key="sw_dsers_rename_key", on_change=on_dsers_rename_change)
+            sw_dsers_rename = st.toggle("直接打开 DSERS 网页端，针对后台已有订单自动修改买家信息", key="sw_dsers_rename_key", on_change=on_dsers_rename_change)
+            if sw_dsers_rename:
+                st.markdown("<span style='font-size: 0.9rem; color: #475569; font-weight: 500;'>选择需要修改的字段（支持勾选组合）：</span>", unsafe_allow_html=True)
+                col_f1, col_f2, col_f3 = st.columns(3)
+                with col_f1:
+                    dsers_mod_name = st.checkbox("客户姓名", value=True, key="dsers_mod_name_key")
+                with col_f2:
+                    dsers_mod_cpf = st.checkbox("CPF 税号", value=True, key="dsers_mod_cpf_key")
+                with col_f3:
+                    dsers_mod_birth = st.checkbox("出生日期 (Birthday)", value=True, key="dsers_mod_birth_key")
+
+                dsers_update_fields = []
+                if dsers_mod_name: dsers_update_fields.append("name")
+                if dsers_mod_cpf: dsers_update_fields.append("cpf")
+                if dsers_mod_birth: dsers_update_fields.append("birthday")
+                if not dsers_update_fields:
+                    st.caption("⚠️ 未勾选任何修改项，请至少勾选一个字段。")
+
 
         st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
         render_dianxiaomi_stock_module(key_prefix="dsers")
@@ -1932,8 +1980,11 @@ else:
                     "sw_dsers_mabang": sw_dsers_mabang if st.session_state.route == "B" else False,
                     "sw_dsers_import": sw_dsers_import if st.session_state.route == "B" else False,
                     "sw_dsers_rename": sw_dsers_rename if st.session_state.route == "B" else False,
+                    "dsers_update_fields": dsers_update_fields if (st.session_state.route == "B" and sw_dsers_rename) else ["name", "cpf", "birthday"],
                     "use_vault": use_vault,
                     "vault_file_choice": vault_file_choice if use_vault else "",
+                    "sku_filter": sku_filter,
+                    "mabang_update_mode": mabang_update_mode,
                 },
                 category="流水线"
             )

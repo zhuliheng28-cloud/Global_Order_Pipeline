@@ -34,6 +34,11 @@ def export_to_cpf_template(progress_callback=None):
     df_cpf['abnnumber'] = cpf_raw
     df_cpf['cpf1_abn'] = '/cpf1 ' + cpf_raw
     df_cpf['TG_Result'] = '' # 空列用于接收结果
+    df_cpf['出生日期'] = '' # 空列用于接收出生日期
+    
+    # 剔除无订单号的空白行
+    valid_mask = df_cpf['订单编号'].ne('') & ~df_cpf['订单编号'].str.lower().isin(['nan', 'none'])
+    df_cpf = df_cpf[valid_mask].copy()
     
     try:
         save_df_to_excel(df_cpf, script_template_path)
